@@ -192,7 +192,7 @@ class SDCalculator:
             [f"{np.linalg.norm(b):.3f}" for b in self.recip_vectors]
         ))
     
-    def get_k_path(self, direction: str, bz_coverage: float, n_k: int,
+    def get_k_path(self, direction: str, bz_coverage: float, n_k: int, 
                    lattice_parameter: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray]:
         """Generates a path of k-points along a specified direction."""
         if isinstance(direction, str):
@@ -328,7 +328,27 @@ class SingleFrequencyModeAnalyzer:
         
     def find_spatial_patterns(self, filtered_displacements: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Finds N dominant spatial patterns in frequency-filtered displacements."""
+        # Input validation
+        if not isinstance(filtered_displacements, np.ndarray):
+            raise TypeError("Input must be a numpy array")
+            
+        if not np.any(np.isfinite(filtered_displacements)):
+            raise ValueError("Input contains non-finite values")
+            
+        if filtered_displacements.ndim != 3:
+            raise ValueError(f"Expected 3D array (frames, atoms, xyz), got shape {filtered_displacements.shape}")
+            
         n_frames, n_atoms, dims = filtered_displacements.shape
+        if dims != 3:
+            raise ValueError(f"Expected 3 spatial dimensions, got {dims}")
+            
+        # Normalize input to improve numerical stability
+        norm = np.linalg.norm(filtered_displacements)
+        if norm < self.tol:
+            raise ValueError("Input displacement amplitudes too small")
+            
+        filtered_displacements = filtered_displacements / norm
+        
         flat_frames = filtered_displacements.reshape(n_frames, -1)
         n_space = n_atoms * dims
         
@@ -363,7 +383,7 @@ class SingleFrequencyModeAnalyzer:
         
         return patterns, weights
             
-    def create_pattern_trajectory(self, pattern: np.ndarray, ref_positions: np.ndarray,
+    def create_pattern_trajectory(self, pattern: np.ndarray, ref_positions: np.ndarray, 
                                 box: Box, atom_types: np.ndarray, amplitude: float = 1.0,
                                 n_frames: int = 20) -> str:
         """Creates a LAMMPS trajectory showing the oscillation of a single pattern."""
@@ -397,8 +417,28 @@ class SingleFrequencyModeAnalyzer:
         
         return filename
 
+def estimate_memory_usage(n_frames: int, n_atoms: int, n_k: int) -> float:
+    """Estimates memory usage in GB."""
+    bytes_per_float = 4  # Using float32
+    bytes_per_complex = 8  # Complex64
+    
+    # Main arrays
+    trajectory_size = n_frames * n_atoms * 3 * bytes_per_float
+    sd_size = n_frames * n_k * 3 * bytes_per_complex
+    sd_per_atom_size = n_frames * n_k * n_atoms * 3 * bytes_per_complex
+    
+    total_bytes = trajectory_size + sd_size + sd_per_atom_size
+    return total_bytes / (1024**3)  # Convert to GB
+
 def main():
     """Main function to execute the SD analysis workflow."""
+    
+    # Add memory estimation
+    try:
+        import psutil
+        available_memory = psutil.virtual_memory().available / (1024**3)  # GB
+    except ImportError:
+        available_memory = None
     parser = argparse.ArgumentParser(description='Spectral Displacement (SD) Analysis Tool')
     parser.add_argument('trajectory', help='Path to the trajectory file')
     parser.add_argument('--config', type=str, help='Path to configuration YAML file', default=None)
@@ -440,6 +480,15 @@ def main():
 
     calculator = SDCalculator(traj, nx, ny, nz)
 
+    # Check memory requirements
+    estimated_memory = estimate_memory_usage(traj.n_frames, traj.n_atoms, n_kpoints)
+    logger.info(f"Estimated memory requirement: {estimated_memory:.1f} GB")
+    
+    if available_memory is not None:
+        logger.info(f"Available system memory: {available_memory:.1f} GB")
+        if estimated_memory > available_memory * 0.9:  # Leave 10% buffer
+            logger.warning("Warning: Memory requirements may exceed available memory!")
+    
     k_points, k_vectors = calculator.get_k_path(
         direction=direction,
         bz_coverage=bz_coverage,
@@ -473,7 +522,27 @@ def main():
     )
 
     # Inverse FFT to get time domain
-    filtered_time = np.fft.ifft(filtered_sd_per_atom, axis=0).real
+    try:
+        filtered_time = np.fft.ifft(filtered_sd_per_atom, axis=0)
+        if not np.any(np.isfinite(filtered_time)):
+            raise ValueError("Non-finite values in FFT result")
+            
+        # Take real part and check for numerical stability
+        filtered_time = np.real(filtered_time).astype(np.float32)
+        
+        # Reshape and handle k-points by averaging
+        n_frames, n_k, n_atoms, dims = filtered_time.shape
+        filtered_time = np.mean(filtered_time, axis=1)  # Average over k-points
+        
+        # Check for valid data
+        if not np.any(np.isfinite(filtered_time)):
+            raise ValueError("Non-finite values after k-point averaging")
+            
+        logger.info(f"Filtered data shape: {filtered_time.shape}")
+        
+    except Exception as e:
+        logger.error(f"Error in FFT processing: {e}")
+        raise
 
     # Pattern analysis
     analyzer = SingleFrequencyModeAnalyzer(n_patterns=n_patterns)
